@@ -119,11 +119,8 @@ thread.
   exactly one daemon and one ffmpeg throughout; no `Address already in
   use` in any log.
 
-## Open questions for approval
+## Open questions for approval — RESOLVED
 
-1. Keep auto desktop/video switching active in the clean build
-   (recommended — isolated, proven, shared restart machinery), or start
-   single-mode and re-add it as a follow-up?
-2. Keep the 3 s `start.sh` watchdog and sender diagnostics
-   (delivered-bytes accounting) as-is? (Recommended yes.)
-3. Anything in the non-goals list you want promoted into scope?
+1. Keep auto desktop/video switching — **YES, keep.**
+2. Keep the 3 s watchdog and sender diagnostics — **YES, keep.**
+3. Non-goals stay non-goals — confirmed.
