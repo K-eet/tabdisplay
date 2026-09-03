@@ -125,17 +125,6 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
         private long byteCount = 0;
         private long lastLogNs = System.nanoTime();
         private boolean firstFramePending = false;
-        // Latency trace: per-AU feed times in a ring (releases preserve
-        // feed order, so release #k pairs with feed #k). Scalar
-        // accumulators only; reported on the existing 5 s stats line.
-        private final long[] feedRing = new long[256];
-        private long fedCount = 0;
-        private long renderedCount = 0;
-        private long lastFeedNs = 0;
-        private double gapSumMs = 0;
-        private double gapMaxMs = 0;
-        private double decSumMs = 0;
-        private double decMaxMs = 0;
 
         ReceiverLoop(Surface s) {
             this.surface = s;
@@ -292,16 +281,8 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
                 Log.w(TAG, "AU truncated: " + len + " -> " + toCopy);
             }
             inBuf.put(data, offset, toCopy);
-            long feedNs = System.nanoTime();
-            decoder.queueInputBuffer(inIdx, 0, toCopy, feedNs / 1000, 0);
-            feedRing[(int) (fedCount % feedRing.length)] = feedNs;
-            if (fedCount > 0) {
-                double gapMs = (feedNs - lastFeedNs) / 1_000_000.0;
-                gapSumMs += gapMs;
-                if (gapMs > gapMaxMs) gapMaxMs = gapMs;
-            }
-            lastFeedNs = feedNs;
-            fedCount++;
+            decoder.queueInputBuffer(inIdx, 0, toCopy,
+                    System.nanoTime() / 1000, 0);
         }
 
         private void drain(MediaCodec decoder, MediaCodec.BufferInfo info,
@@ -317,16 +298,6 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
 
                 decoder.releaseOutputBuffer(outIdx, true);
                 frameCount++;
-                if (renderedCount < fedCount) {
-                    double decMs = (System.nanoTime()
-                            - feedRing[(int) (renderedCount % feedRing.length)])
-                            / 1_000_000.0;
-                    if (decMs >= 0) {
-                        decSumMs += decMs;
-                        if (decMs > decMaxMs) decMaxMs = decMs;
-                    }
-                }
-                renderedCount++;
                 if (firstFramePending) {
                     firstFramePending = false;
                     setBlackout(false);
@@ -335,20 +306,12 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
                 long now = System.nanoTime();
                 if (now - lastLogNs >= 5_000_000_000L) {
                     double secs = (now - lastLogNs) / 1e9;
-                    long gaps = Math.max(0, fedCount - 1);
                     Log.i(TAG, String.format(
-                            "decoded %d frames in %.1fs (%.1f fps, %.1f Mbps in); "
-                            + "feed gap avg %.0f max %.0f ms, decode avg %.1f max %.1f ms",
+                            "decoded %d frames in %.1fs (%.1f fps, %.1f Mbps in)",
                             frameCount, secs, frameCount / secs,
-                            (byteCount * 8.0) / 1_000_000.0 / secs,
-                            gaps > 0 ? gapSumMs / gaps : 0, gapMaxMs,
-                            frameCount > 0 ? decSumMs / frameCount : 0, decMaxMs));
+                            (byteCount * 8.0) / 1_000_000.0 / secs));
                     frameCount = 0;
                     byteCount = 0;
-                    gapSumMs = 0;
-                    gapMaxMs = 0;
-                    decSumMs = 0;
-                    decMaxMs = 0;
                     lastLogNs = now;
                 }
             }
