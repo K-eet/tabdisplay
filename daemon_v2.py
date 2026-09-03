@@ -17,6 +17,7 @@ most recent frame into the fresh encoder, so the client's first bytes are a
 SPS+PPS+IDR access unit — no waiting for the next scheduled keyframe.
 """
 import argparse
+import fcntl
 import logging
 import os
 import signal
@@ -286,6 +287,13 @@ def build_ffmpeg_cmd(args, mode: dict) -> list:
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-init_hw_device", f"vaapi=va:{args.vaapi_device}",
         "-filter_hw_device", "va",
+        # Wall-clock arrival timestamps for the rawvideo input. Without
+        # this the demuxer stamps PTS by frame count (1/60 s each), which
+        # silently turns time-based behaviour back into frame-count
+        # behaviour at idle: the 0.5 s forced-IDR cadence would stretch to
+        # ~30 real seconds at 1 fps, and VBR would misallocate bits. With
+        # real timestamps both stay honest at any fps.
+        "-use_wallclock_as_timestamps", "1",
         "-f", "rawvideo",
         "-pix_fmt", in_pix,
         "-s", f"{FRAME_W}x{FRAME_H}",
@@ -391,6 +399,25 @@ def relay_stderr(proc: subprocess.Popen, shutdown: threading.Event) -> None:
         pass    # pipes closed by a concurrent restart — expected
 
 
+def _grow_pipe(fileobj, size: int = 1 << 20) -> None:
+    """Grow a pipe buffer (default 64 KB -> up to 1 MB).
+
+    A 16 MB frame crosses a 64 KB pipe in ~256 fill/drain round trips,
+    each costing context switches — measured 9-23 ms per frame write.
+    A 1 MB buffer cuts that to ~16 trips (~1-2 ms) with zero quality
+    impact; the encoder keeps up at these rates, so the extra in-flight
+    buffering never accumulates into delay."""
+    try:
+        with open("/proc/sys/fs/pipe-max-size") as fh:
+            cap = int(fh.read().strip())
+    except (OSError, ValueError):
+        cap = size
+    try:
+        fcntl.fcntl(fileobj.fileno(), fcntl.F_SETPIPE_SZ, min(size, cap))
+    except OSError as exc:
+        log.warning("could not grow pipe buffer: %s", exc)
+
+
 def _spawn_ffmpeg(args, mode: dict, sink, shutdown):
     """Start ffmpeg for ``mode`` and the two relay threads. Returns
     (proc, [stdout_thr, stderr_thr])."""
@@ -405,6 +432,8 @@ def _spawn_ffmpeg(args, mode: dict, sink, shutdown):
         stderr=subprocess.PIPE,
         bufsize=0,
     )
+    _grow_pipe(proc.stdin)
+    _grow_pipe(proc.stdout)
     stdout_thr = threading.Thread(
         target=relay_stdout, args=(proc, sink, shutdown),
         name=f"ffmpeg-stdout/{mode['label']}", daemon=True)
