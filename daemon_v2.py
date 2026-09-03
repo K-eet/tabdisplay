@@ -357,13 +357,24 @@ def build_ffmpeg_cmd(args, mode: dict) -> list:
 
 
 def relay_stdout(proc: subprocess.Popen, sink: FrameSink,
-                 shutdown: threading.Event) -> None:
-    """Drain ffmpeg's stdout and forward chunks to the current client."""
+                 shutdown: threading.Event, trace: dict) -> None:
+    """Drain ffmpeg's stdout and forward chunks to the current client.
+
+    Also performs latency tracing: output AUs are counted by AUD start
+    code (order is preserved — no B-frames, async_depth 1 — so output AU
+    #k corresponds to the k-th frame written to stdin). Completion and
+    send timestamps let us split glass-to-glass into encode vs deliver.
+    All attribution is O(1) per chunk; per-window aggregates only.
+    """
     fd = proc.stdout.fileno()
     CHUNK = 64 * 1024
+    AUD = b"\x00\x00\x00\x01\x09"
     produced = 0                     # bytes out of the encoder
     delivered = 0                    # bytes actually handed to a client
     last_log = time.monotonic()
+    tail = b""                        # 3-byte overlap for split AUDs
+    for t in ("win_enc", "win_del"):
+        trace.setdefault(t, [])
     while not shutdown.is_set():
         try:
             data = os.read(fd, CHUNK)
@@ -372,16 +383,48 @@ def relay_stdout(proc: subprocess.Popen, sink: FrameSink,
         if not data:
             break
         produced += len(data)
+        # Count completed output AUs (with cross-chunk overlap handling).
+        view = tail + data
+        t_done_chunk = None
+        start = 0
+        while True:
+            idx = view.find(AUD, start)
+            if idx < 0:
+                break
+            trace["out_au"] += 1
+            seq = trace["out_au"] - 1     # 1st output <-> 0th written frame
+            t_done_chunk = time.monotonic()
+            t_written = trace["pending"].pop(seq, None)
+            if t_written is not None:
+                trace["win_enc"].append((t_done_chunk - t_written) * 1000.0)
+            start = idx + len(AUD)
+        tail = view[-3:] if len(view) >= 3 else view
         if sink.has_client():
             if sink.send(data):
                 delivered += len(data)
+                if t_done_chunk is not None:
+                    trace["win_del"].append(
+                        (time.monotonic() - t_done_chunk) * 1000.0)
         now = time.monotonic()
         if now - last_log >= 5.0:
-            log.info("relay: %d KB encoded, %d KB delivered in %.1fs",
-                     produced // 1024, delivered // 1024, now - last_log)
+            enc = trace["win_enc"]
+            dele = trace["win_del"]
+            def stats(xs):
+                return "n/a" if not xs else "avg %.1f max %.1f n=%d" % (
+                    sum(xs) / len(xs), max(xs), len(xs))
+            log.info("relay: %d KB encoded, %d KB delivered in %.1fs; "
+                     "encode [%s] deliver [%s] pending=%d",
+                     produced // 1024, delivered // 1024, now - last_log,
+                     stats(enc), stats(dele), len(trace["pending"]))
             produced = 0
             delivered = 0
             last_log = now
+            trace["win_enc"] = []
+            trace["win_del"] = []
+            # Bound memory: drop attributions older than 300 frames.
+            old = trace["seq"] - 300
+            for k in [k for k in trace["pending"] if k < old]:
+                del trace["pending"][k]
     log.info("relay_stdout exiting (%d bytes delivered total)",
              delivered)
 
@@ -418,7 +461,7 @@ def _grow_pipe(fileobj, size: int = 1 << 20) -> None:
         log.warning("could not grow pipe buffer: %s", exc)
 
 
-def _spawn_ffmpeg(args, mode: dict, sink, shutdown):
+def _spawn_ffmpeg(args, mode: dict, sink, shutdown, trace: dict):
     """Start ffmpeg for ``mode`` and the two relay threads. Returns
     (proc, [stdout_thr, stderr_thr])."""
     cmd = build_ffmpeg_cmd(args, mode)
@@ -435,7 +478,7 @@ def _spawn_ffmpeg(args, mode: dict, sink, shutdown):
     _grow_pipe(proc.stdin)
     _grow_pipe(proc.stdout)
     stdout_thr = threading.Thread(
-        target=relay_stdout, args=(proc, sink, shutdown),
+        target=relay_stdout, args=(proc, sink, shutdown, trace),
         name=f"ffmpeg-stdout/{mode['label']}", daemon=True)
     stderr_thr = threading.Thread(
         target=relay_stderr, args=(proc, shutdown),
@@ -506,11 +549,18 @@ def restart_ffmpeg(state: dict, args, new_mode: dict, sink, shutdown,
     for t in old_threads:
         t.join(timeout=2)
 
-    new_proc, new_threads = _spawn_ffmpeg(args, new_mode, sink, shutdown)
+    new_proc, new_threads = _spawn_ffmpeg(args, new_mode, sink, shutdown,
+                                          state["trace"])
     state["proc"]          = new_proc
     state["mode"]          = new_mode
     state["threads"]       = new_threads
     state["frame_counter"] = 0
+    # Fresh encoder generation: output AU numbering restarts, so drop any
+    # unattributed in-flight frames from the trace.
+    state["trace"]["out_au"] = 0
+    state["trace"]["pending"].clear()
+    state["trace"]["win_enc"] = []
+    state["trace"]["win_del"] = []
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +635,14 @@ def run(args) -> int:
     restart_lock = threading.Lock()
     shutdown = threading.Event()
 
+    # Latency trace state. ``seq`` numbers frames written to ffmpeg stdin;
+    # ``pending`` maps seq -> write-completion time for frames whose
+    # encoded AU hasn't emerged yet; ``out_au`` counts completed output
+    # AUs (order-preserved, so output #k <-> input seq k-1... see relay).
+    # All updates are timestamp reads + int ops; aggregates only.
+    trace = {"seq": 0, "pending": {}, "out_au": 0,
+             "win_enc": [], "win_del": []}
+
     # ``last_payload`` holds a private snapshot of the most recent raw frame
     # (refreshed at most twice per second) so a newly connected tablet can be
     # handed an immediate keyframe instead of waiting for the next scheduled
@@ -628,9 +686,10 @@ def run(args) -> int:
 
     sink = FrameSink(args.port, on_connect=handle_client_connect)
 
-    proc, threads = _spawn_ffmpeg(args, DESKTOP_MODE, sink, shutdown)
+    proc, threads = _spawn_ffmpeg(args, DESKTOP_MODE, sink, shutdown, trace)
     state["proc"]    = proc
     state["threads"] = threads
+    state["trace"]   = trace
 
     detector = MotionDetector(
         threshold_high=args.video_threshold,
@@ -724,6 +783,11 @@ def run(args) -> int:
                 stats["last_cache"] = t2
         else:
             state["last_payload"] = payload
+
+        # Trace: this successfully written frame gets the next sequence
+        # number; the relay attributes its encoded AU back to t2.
+        trace["pending"][trace["seq"]] = t2
+        trace["seq"] += 1
 
         stats["frames"] += 1
         stats["ms_conv_total"]  += (t1 - t0) * 1000
