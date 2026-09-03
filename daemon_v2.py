@@ -294,6 +294,11 @@ def build_ffmpeg_cmd(args, mode: dict) -> list:
         # ~30 real seconds at 1 fps, and VBR would misallocate bits. With
         # real timestamps both stay honest at any fps.
         "-use_wallclock_as_timestamps", "1",
+        # Skip input-side buffering: frames enter the filter graph as
+        # soon as they arrive instead of queueing in AVIO/demuxer
+        # buffers. Zero quality impact; cuts queue-wait latency.
+        "-fflags", "nobuffer",
+        "-avioflags", "direct",
         "-f", "rawvideo",
         "-pix_fmt", in_pix,
         "-s", f"{FRAME_W}x{FRAME_H}",
