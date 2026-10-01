@@ -1,5 +1,11 @@
 # Phase 6 — Clean-sheet receiver rewrite — SPEC (draft, needs approval)
 
+> **Partly superseded 2026-10-01** (see `review_2026-10-01.md`): the wire
+> format is now length-prefixed access units, so R2 (AUD accumulator), R3
+> (100 ms input timeout, drop on miss) and R4 (polling drains) no longer
+> describe the receiver, and R10's "all codec calls on the rx thread" is
+> relaxed for the async output callback. R1 and R5–R9 still hold.
+
 ## Premise
 
 Rewrite `ReceiverActivity_v2.java` from zero, with every lesson from
