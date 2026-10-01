@@ -1,0 +1,32 @@
+From 4ad462a4cfd4301105091a8c2ff420d8731af13c Mon Sep 17 00:00:00 2001
+From: user <user@localhost>
+Date: Thu, 3 Sep 2026 23:28:02 +0800
+Subject: [PATCH] pyevdi: expose framebuffer as memoryview + buffer_size
+ (required by tabdisplay daemon)
+
+---
+ pyevdi/PyEvdi.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/pyevdi/PyEvdi.cpp b/pyevdi/PyEvdi.cpp
+index e10c56e..bfe6d08 100644
+--- a/pyevdi/PyEvdi.cpp
++++ b/pyevdi/PyEvdi.cpp
+@@ -80,7 +80,13 @@ PYBIND11_MODULE(PyEvdi, m)
+ 			"id", [](Buffer &self) { return self.buffer.id; })
+ 		.def_property_readonly("bytes",
+ 				       [](Buffer &self) {
+-					       return self.buffer.buffer;
++					       return py::memoryview::from_memory(
++						       self.buffer.buffer,
++						       self.buffer_size);
++				       })
++		.def_property_readonly("buffer_size",
++				       [](Buffer &self) {
++					       return self.buffer_size;
+ 				       })
+ 		.def_property_readonly(
+ 			"width", [](Buffer &self) { return self.buffer.width; })
+-- 
+2.43.0
+
