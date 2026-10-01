@@ -6,6 +6,8 @@ import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -18,10 +20,13 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 // NOTE (R6): there is deliberately no android.graphics import in this
 // file. Only MediaCodec may produce into the Surface; drawing to it with
@@ -30,16 +35,22 @@ import java.nio.ByteBuffer;
 // the overlay View, never with pixels.
 
 /**
- * Phase 6 receiver: H.264 Annex B over TCP -> MediaCodec -> Surface.
+ * Receiver: length-prefixed H.264 access units over TCP -> MediaCodec ->
+ * Surface.
  *
- * Sender contract (see phase6_spec.md): one AU per frame led by an AUD
- * NAL, fresh SPS+PPS+IDR at every stream start and at least every 0.5 s
- * thereafter, fixed 2560x1600, single client. Cursor is kernel-blended
- * sender-side; this client knows nothing about cursors.
+ * Sender contract (daemon_v2.py): the stream is a sequence of
+ * [u32 big-endian length][one Annex B access unit]; the first AU of every
+ * connection is SPS+PPS+IDR, with another IDR at least every 0.5 s of
+ * wall-clock time; fixed 2560x1600; single client. Cursor is
+ * kernel-blended sender-side; this client knows nothing about cursors.
  *
  * Structure: one rx thread owns the socket and one decoder per
- * connection. Anything thrown inside runOnce() ends the session, never
- * the thread: show overlay, sleep on failure, reconnect.
+ * connection. It only reads frames and queues them. The decoder runs in
+ * asynchronous mode, so every decoded frame is rendered from the codec's
+ * own callback the instant it is ready — nothing polls for output, and a
+ * frame never waits on the next one. Anything thrown inside runOnce() ends
+ * the session, never the thread: show overlay, sleep on failure,
+ * reconnect.
  */
 public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callback {
 
@@ -50,15 +61,17 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
     private static final int FRAME_H = 1600;
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final int RECONNECT_SLEEP_MS = 1000;
-    private static final int READ_CHUNK = 64 * 1024;
-    private static final int ACCUM_MAX = 4 * 1024 * 1024;
-    private static final int DEQUEUE_INPUT_TIMEOUT_US = 100_000;
-    private static final int TAIL_DRAIN_TIMEOUT_US = 5_000;
+    private static final int INPUT_WAIT_MS = 100;
+    private static final int STOP_JOIN_MS = 1000;
 
     private SurfaceView surfaceView;
     private View blackout;
     private volatile Thread rxThread;
     private volatile boolean running;
+    // The rx thread's current socket, published so surfaceDestroyed can
+    // close it: closing is the only thing that unblocks a socket read
+    // (Thread.interrupt() does not).
+    private volatile Socket socket;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,21 +123,40 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
         Log.i(TAG, "surfaceChanged " + width + "x" + height + " fmt=" + format);
     }
 
+    /**
+     * The Surface is invalid once this returns, so the rx thread and its
+     * decoder must be gone by then — and its socket closed, or the next
+     * surfaceCreated would open a second connection alongside it.
+     */
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         running = false;
         Thread t = rxThread;
-        if (t != null) t.interrupt();
         rxThread = null;
+        closeQuietly(socket);
+        if (t == null) return;
+        t.interrupt();
+        try {
+            t.join(STOP_JOIN_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (t.isAlive()) Log.w(TAG, "rx thread still running after surface loss");
+    }
+
+    private static void closeQuietly(Socket s) {
+        if (s == null) return;
+        try { s.close(); } catch (IOException ignore) {}
     }
 
     private final class ReceiverLoop implements Runnable {
         private final Surface surface;
 
+        // Written by the rx thread, read by the codec callback thread.
+        private final AtomicLong byteCount = new AtomicLong();
+        // Codec callback thread only.
         private long frameCount = 0;
-        private long byteCount = 0;
         private long lastLogNs = System.nanoTime();
-        private boolean firstFramePending = false;
 
         ReceiverLoop(Surface s) {
             this.surface = s;
@@ -150,171 +182,157 @@ public class ReceiverActivity_v2 extends Activity implements SurfaceHolder.Callb
         }
 
         private void runOnce() throws IOException {
-            try (Socket socket = openSocket()) {
-                InputStream in = socket.getInputStream();
+            Socket s = new Socket();
+            socket = s;
+            HandlerThread codecThread = new HandlerThread("codec-cb");
+            try {
+                // Re-check after publishing the socket: either we see the
+                // stop here, or surfaceDestroyed sees the socket and closes it.
+                if (!running) return;
+                s.connect(new InetSocketAddress(HOST, PORT), CONNECT_TIMEOUT_MS);
+                s.setTcpNoDelay(true);
                 Log.i(TAG, "connected to " + HOST + ":" + PORT);
+                FrameReader reader = new FrameReader(s.getInputStream());
 
-                MediaCodec decoder = createDecoder();
-                decoder.start();
-                Log.i(TAG, "MediaCodec started (AVC, " + FRAME_W + "x" + FRAME_H
-                        + ", Surface)");
-                firstFramePending = true;
-
+                codecThread.start();
+                Session session = new Session();
+                MediaCodec decoder = createDecoder(
+                        session, new Handler(codecThread.getLooper()));
                 try {
-                    pump(in, decoder);
+                    decoder.start();
+                    Log.i(TAG, "MediaCodec started (AVC, " + FRAME_W + "x" + FRAME_H
+                            + ", Surface)");
+                    pump(reader, decoder, session);
                 } finally {
                     try { decoder.stop(); } catch (Exception ignore) {}
                     try { decoder.release(); } catch (Exception ignore) {}
                 }
+            } finally {
+                codecThread.quitSafely();
+                socket = null;
+                closeQuietly(s);
             }
         }
 
-        private Socket openSocket() throws IOException {
-            Socket s = new Socket();
-            s.connect(new InetSocketAddress(HOST, PORT), CONNECT_TIMEOUT_MS);
-            s.setTcpNoDelay(true);
-            return s;
-        }
-
-        private MediaCodec createDecoder() throws IOException {
+        private MediaCodec createDecoder(Session session, Handler handler)
+                throws IOException {
             MediaFormat fmt = MediaFormat.createVideoFormat(
                     MediaFormat.MIMETYPE_VIDEO_AVC, FRAME_W, FRAME_H);
             fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024);
+            fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, FrameReader.MAX_AU);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
             }
             MediaCodec decoder =
                     MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-            decoder.configure(fmt, surface, null, 0);
+            try {
+                // Must precede configure(): this is what selects async mode.
+                decoder.setCallback(session, handler);
+                decoder.configure(fmt, surface, null, 0);
+            } catch (RuntimeException e) {
+                decoder.release();
+                throw e;
+            }
             return decoder;
         }
 
-        private void pump(InputStream in, MediaCodec decoder) throws IOException {
-            final byte[] accum = new byte[ACCUM_MAX];
-            int accumLen = 0;
-            final byte[] rxBuf = new byte[READ_CHUNK];
-            final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-
+        private void pump(FrameReader reader, MediaCodec decoder, Session session)
+                throws IOException {
             while (running) {
-                int n = in.read(rxBuf, 0, rxBuf.length);
-                if (n < 0) {
+                int len = reader.next();
+                if (len < 0) {
                     Log.w(TAG, "socket EOF");
                     return;
                 }
-                byteCount += n;
-
-                if (accumLen + n > ACCUM_MAX) {
-                    Log.w(TAG, "accumulator overflow (have " + accumLen
-                            + ", adding " + n + "); resetting until next AUD");
-                    accumLen = 0;
-                }
-                System.arraycopy(rxBuf, 0, accum, accumLen, n);
-                accumLen += n;
-
-                int firstAud = findAudStart(accum, 0, accumLen);
-                if (firstAud < 0) continue;
-                if (firstAud > 0) {
-                    System.arraycopy(accum, firstAud, accum, 0, accumLen - firstAud);
-                    accumLen -= firstAud;
-                }
-
-                int audIdx = 0;
-                while (true) {
-                    int nextAud = findAudStart(accum, audIdx + 4, accumLen);
-                    if (nextAud < 0) break;
-                    feedAU(decoder, accum, audIdx, nextAud - audIdx);
-                    drain(decoder, info, 0);
-                    audIdx = nextAud;
-                }
-                // Burst-tail catch: the per-AU drain above trails one AU
-                // behind, so the final decoded frame of a burst would sit
-                // unrendered until the next AU — seconds away at idle fps,
-                // forever if updates stop. One short blocking wait renders
-                // it now.
-                drain(decoder, info, TAIL_DRAIN_TIMEOUT_US);
-
-                if (audIdx > 0) {
-                    System.arraycopy(accum, audIdx, accum, 0, accumLen - audIdx);
-                    accumLen -= audIdx;
-                }
+                byteCount.addAndGet(len + 4);
+                feedAU(decoder, session, reader.buffer(), len);
             }
         }
 
         /**
-         * Locate an Annex-B NAL of type 9 (Access Unit Delimiter).
-         * Returns the start-code index, or -1 if none in [from, to).
+         * Queue one access unit, waiting as long as it takes for a free
+         * input buffer. Never drops: a dropped AU breaks the reference
+         * chain until the next IDR, while waiting only pushes back on TCP.
          */
-        private int findAudStart(byte[] buf, int from, int to) {
-            int i = Math.max(0, from);
-            int last = to - 4;
-            while (i <= last) {
-                if (buf[i] == 0 && buf[i + 1] == 0) {
-                    if (buf[i + 2] == 1) {                                   // 00 00 01 SC
-                        if ((buf[i + 3] & 0x1F) == 9) return i;
-                        i += 3;
-                        continue;
-                    }
-                    if (i + 4 < to && buf[i + 2] == 0 && buf[i + 3] == 1) {  // 00 00 00 01 SC
-                        if ((buf[i + 4] & 0x1F) == 9) return i;
-                        i += 4;
-                        continue;
-                    }
+        private void feedAU(MediaCodec decoder, Session session, byte[] data, int len)
+                throws IOException {
+            Integer inIdx = null;
+            while (inIdx == null) {
+                if (!running) return;
+                if (session.error != null) {
+                    throw new IOException("decoder error", session.error);
                 }
-                i++;
-            }
-            return -1;
-        }
-
-        private void feedAU(MediaCodec decoder, byte[] data, int offset, int len) {
-            int inIdx = decoder.dequeueInputBuffer(DEQUEUE_INPUT_TIMEOUT_US);
-            if (inIdx < 0) {
-                Log.w(TAG, "no input buf; dropping AU of " + len + " B");
-                return;
+                try {
+                    inIdx = session.freeInputs.poll(INPUT_WAIT_MS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("interrupted waiting for input buffer");
+                }
             }
             ByteBuffer inBuf = decoder.getInputBuffer(inIdx);
-            if (inBuf == null) return;
-            inBuf.clear();
-            int toCopy = Math.min(len, inBuf.remaining());
-            if (toCopy < len) {
-                Log.w(TAG, "AU truncated: " + len + " -> " + toCopy);
+            if (inBuf == null || len > inBuf.capacity()) {
+                // Ending the session makes the sender open with a fresh IDR.
+                throw new IOException("AU of " + len + " B does not fit input buffer");
             }
-            inBuf.put(data, offset, toCopy);
-            decoder.queueInputBuffer(inIdx, 0, toCopy,
-                    System.nanoTime() / 1000, 0);
+            inBuf.clear();
+            inBuf.put(data, 0, len);
+            decoder.queueInputBuffer(inIdx, 0, len, System.nanoTime() / 1000, 0);
         }
 
-        private void drain(MediaCodec decoder, MediaCodec.BufferInfo info,
-                           long timeoutUs) {
-            while (running) {
-                int outIdx = decoder.dequeueOutputBuffer(info, timeoutUs);
-                if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) return;
-                if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    Log.i(TAG, "output format changed: " + decoder.getOutputFormat());
-                    continue;
-                }
-                if (outIdx < 0) continue;
+        /**
+         * One decoder's callbacks, run on the codec-cb thread. Free input
+         * buffer indices are handed to the rx thread through a queue;
+         * output buffers are rendered right here.
+         */
+        private final class Session extends MediaCodec.Callback {
+            final LinkedBlockingQueue<Integer> freeInputs = new LinkedBlockingQueue<>();
+            volatile MediaCodec.CodecException error;
+            private boolean firstFramePending = true;
 
-                decoder.releaseOutputBuffer(outIdx, true);
+            @Override
+            public void onInputBufferAvailable(MediaCodec codec, int index) {
+                freeInputs.offer(index);
+            }
+
+            @Override
+            public void onOutputBufferAvailable(MediaCodec codec, int index,
+                                                MediaCodec.BufferInfo info) {
+                try {
+                    codec.releaseOutputBuffer(index, true);
+                } catch (IllegalStateException e) {
+                    return;                 // codec is being stopped
+                }
                 frameCount++;
                 if (firstFramePending) {
                     firstFramePending = false;
                     setBlackout(false);
                 }
-
-                long now = System.nanoTime();
-                if (now - lastLogNs >= 5_000_000_000L) {
-                    double secs = (now - lastLogNs) / 1e9;
-                    Log.i(TAG, String.format(
-                            "decoded %d frames in %.1fs (%.1f fps, %.1f Mbps in)",
-                            frameCount, secs, frameCount / secs,
-                            (byteCount * 8.0) / 1_000_000.0 / secs));
-                    frameCount = 0;
-                    byteCount = 0;
-                    lastLogNs = now;
-                }
+                logStats();
             }
+
+            @Override
+            public void onError(MediaCodec codec, MediaCodec.CodecException e) {
+                Log.w(TAG, "decoder error: " + e.getDiagnosticInfo());
+                error = e;
+            }
+
+            @Override
+            public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
+                Log.i(TAG, "output format changed: " + format);
+            }
+        }
+
+        private void logStats() {
+            long now = System.nanoTime();
+            if (now - lastLogNs < 5_000_000_000L) return;
+            double secs = (now - lastLogNs) / 1e9;
+            Log.i(TAG, String.format(
+                    "decoded %d frames in %.1fs (%.1f fps, %.1f Mbps in)",
+                    frameCount, secs, frameCount / secs,
+                    (byteCount.getAndSet(0) * 8.0) / 1_000_000.0 / secs));
+            frameCount = 0;
+            lastLogNs = now;
         }
 
         private void sleepQuiet(long ms) {
