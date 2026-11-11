@@ -11,10 +11,15 @@ tablet: MediaCodec + pointer overlay ◄── DisplayActivity ◄── adb rev
 Plug the tablet in: a monitor appears in Settings → Displays and the tablet
 shows it. Unplug: the monitor goes away and its windows return to the laptop.
 
+Touching the tablet works as a touchscreen (multitouch gestures included) and
+the stylus as a pen tablet: pressure, tilt, hover, side button, eraser. A hand
+resting on the glass is ignored while the pen is near.
+
 | Piece | What it does |
 |---|---|
 | `host/tabdisplayd.py` | Daemon: adb link, virtual monitor lifecycle, layout, stream relay, stats |
 | `host/tdcap.c` | PipeWire screencast → VAAPI encoder, zero-copy; paces frames to 60 Hz |
+| `host/inputdev.py` | Virtual touchscreen and pen (uinput) fed by the tablet's touch and stylus |
 | `host/scrub.py` | Forces a repaint to clear a mutter stale-pointer bug |
 | `android/` | Receiver app (`DisplayActivity`, `Wire`) |
 | `install.sh` | Builds everything, installs the udev rule and systemd user service |
@@ -58,7 +63,7 @@ python3 host/tabdisplayd.py --serial <adb serial>
 python3 host/tabdisplayd.py --help
 ```
 
-Useful options: `--scale 1.75` (initial display scale), `--cursor embedded`
+Useful options: `--no-input` (display only), `--scale 1.75` (initial display scale), `--cursor embedded`
 (pointer inside the video instead of drawn by the tablet), `--codec hevc`,
 `--size 1920x1200` (render smaller, tablet scales up), `--rc vbr --bitrate 20000`.
 
@@ -74,9 +79,10 @@ captured to the tablet handing it to its display.
 python3 -m unittest tests.test_host
 cd android && JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 ./gradlew testDebugUnitTest
 python3 host/tabdisplayd.py --no-adb & python3 bench/fakeclient.py 5   # end to end, no tablet
+python3 bench/inputwatch.py meta & python3 bench/fakeclient.py 7 2560x1600 7070 input   # touch + pen
 ```
 
-## Wire protocol (v3)
+## Wire protocol (v4)
 
 Both directions: `[u8 type][u32 LE length][payload]`. The message catalogue is
 in the docstring of `host/tabdisplayd.py`; video, pointer and sprite records

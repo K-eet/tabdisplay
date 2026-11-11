@@ -13,7 +13,7 @@ import java.nio.ByteOrder;
  */
 final class Wire {
 
-    static final int VERSION = 3;
+    static final int VERSION = 4;
     /** Largest message accepted; also sizes the decoder's input buffers. */
     static final int MAX_MSG = 8 * 1024 * 1024;
     /** Bytes of header in front of the access unit in a 'V' message. */
@@ -89,6 +89,38 @@ final class Wire {
     /** The current message, sent back as it came (link round-trip probe). */
     static byte[] echo(Wire w) {
         return message((char) w.type(), w.length()).put(w.payload(), 0, w.length()).array();
+    }
+
+    static final int PEN_IN_RANGE = 1;
+    static final int PEN_TOUCHING = 2;
+    static final int PEN_BUTTON = 4;
+    static final int PEN_ERASER = 8;
+
+    /** Position or pressure in 0..1 as the wire's 0..65535. */
+    static int unit(float v) {
+        return Math.round(Math.max(0f, Math.min(1f, v)) * 65535f);
+    }
+
+    /**
+     * Every finger currently known, {@code count} of them: parallel arrays
+     * of pointer id, whether it is down, and position as {@link #unit}.
+     */
+    static byte[] fingers(int count, int[] id, boolean[] down, int[] x, int[] y) {
+        ByteBuffer b = message('F', 1 + 6 * count).put((byte) count);
+        for (int i = 0; i < count; i++) {
+            b.put((byte) id[i]).put((byte) (down[i] ? 1 : 0))
+                    .putShort((short) x[i]).putShort((short) y[i]);
+        }
+        return b.array();
+    }
+
+    /** Stylus state; tilt in degrees from upright, clamped to a byte. */
+    static byte[] pen(int flags, int x, int y, int pressure, int tiltX, int tiltY) {
+        return message('N', 9).put((byte) flags)
+                .putShort((short) x).putShort((short) y).putShort((short) pressure)
+                .put((byte) Math.max(-90, Math.min(90, tiltX)))
+                .put((byte) Math.max(-90, Math.min(90, tiltY)))
+                .array();
     }
 
     /** Frame with capture time {@code ts} is on its way to the panel. */

@@ -75,11 +75,15 @@ sudo tee "$RULE" >/dev/null <<RULE_EOF
 # ID_MM_DEVICE_IGNORE keeps ModemManager from probing the tablet's serial
 # interface with AT commands while adb is coming up.
 ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{serial}=="$SERIAL", TAG+="systemd", SYMLINK+="tabdisplay", ENV{SYSTEMD_USER_WANTS}+="tabdisplay.service", ENV{ID_MM_DEVICE_IGNORE}="1"
+# Touch and pen input is replayed through uinput; give the logged-in user
+# access to it (uaccess = whoever is at the seat, same as for adb devices).
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
 RULE_EOF
 echo "wrote $RULE"
 
 sudo udevadm control --reload
 systemctl --user daemon-reload
+sudo udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
 sudo udevadm trigger --action=add --subsystem-match=usb --attr-match=serial="$SERIAL"
 sleep 1
 systemctl --user --no-pager --lines=0 status tabdisplay.service || true

@@ -19,6 +19,8 @@ import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.InputDevice;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -37,6 +39,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -60,6 +64,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     private static final String HOST = "localhost";
     private static final int PORT = 7070;
     private static final int RETRY_MS = 300;
+    private static final int PEN_GONE_MS = 300;
     private static final int FRAME_RATE = 60;
     // The decoder's clocks follow the rate it is told to expect, and left
     // alone it assumes 30 fps. Declaring more than the real rate buys
@@ -83,6 +88,14 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     private boolean ptrSpriteChanged;
     private boolean ptrUpdateQueued;
     private volatile float streamToView = 1f;
+
+    // Input forwarding (UI thread), and the link to send it on.
+    // Socket writes are not allowed on the UI thread, where input arrives.
+    private final ExecutorService inputTx = Executors.newSingleThreadExecutor();
+    private volatile Decoder sender;
+    private boolean penInRange, fingersDown;
+    private final int[] fId = new int[10], fX = new int[10], fY = new int[10];
+    private final boolean[] fDown = new boolean[10];
 
     /** Unplugging the cable is how a monitor is turned off. */
     private final BroadcastReceiver unplugged = new BroadcastReceiver() {
@@ -147,6 +160,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     @Override
     protected void onDestroy() {
         unregisterReceiver(unplugged);
+        inputTx.shutdownNow();
         super.onDestroy();
     }
 
@@ -232,6 +246,118 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             mask |= Wire.CODEC_HEVC;
         }
         return mask;
+    }
+
+    // ------------------------------------------------------------------
+    // Touch and pen: reported to the host, which replays them as a real
+    // touchscreen and pen tablet. Nothing is interpreted here.
+    // ------------------------------------------------------------------
+
+    private static boolean isStylus(int toolType) {
+        return toolType == MotionEvent.TOOL_TYPE_STYLUS
+                || toolType == MotionEvent.TOOL_TYPE_ERASER;
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent e) {
+        forwardInput(e);
+        return true;
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent e) {
+        if (e.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) {
+            forwardInput(e);        // stylus hovering
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(e);
+    }
+
+    private void forwardInput(MotionEvent e) {
+        Decoder link = sender;
+        float w = video.getWidth(), h = video.getHeight();
+        if (link == null || w <= 1 || h <= 1) return;
+        int action = e.getActionMasked();
+
+        int stylus = -1;
+        for (int i = 0; i < e.getPointerCount(); i++) {
+            if (isStylus(e.getToolType(i))) stylus = i;
+        }
+        if (stylus >= 0) {
+            // A hand resting on the glass while writing is not a touch.
+            if (fingersDown) {
+                fingersDown = false;
+                post(link, Wire.fingers(0, null, null, null, null));
+            }
+            forwardPen(link, e, stylus, action, w, h);
+            return;
+        }
+        if (penInRange) return;
+
+        int n = Math.min(e.getPointerCount(), 10);
+        boolean allUp = action == MotionEvent.ACTION_UP
+                || action == MotionEvent.ACTION_CANCEL;
+        int lifted = action == MotionEvent.ACTION_POINTER_UP ? e.getActionIndex() : -1;
+        for (int i = 0; i < n; i++) {
+            fId[i] = e.getPointerId(i);
+            fDown[i] = !allUp && i != lifted;
+            fX[i] = Wire.unit(e.getX(i) / (w - 1));
+            fY[i] = Wire.unit(e.getY(i) / (h - 1));
+        }
+        fingersDown = !allUp;
+        post(link, Wire.fingers(n, fId, fDown, fX, fY));
+    }
+
+    private final Runnable penGone = () -> {
+        penInRange = false;
+        Decoder link = sender;
+        if (link != null) post(link, Wire.pen(0, 0, 0, 0, 0, 0));
+    };
+
+    private void post(final Decoder link, final byte[] message) {
+        inputTx.execute(() -> link.send(message));
+    }
+
+    private void forwardPen(Decoder link, MotionEvent e, int i, int action,
+                            float w, float h) {
+        boolean gone = action == MotionEvent.ACTION_HOVER_EXIT
+                || action == MotionEvent.ACTION_CANCEL;
+        boolean touching = action == MotionEvent.ACTION_DOWN
+                || action == MotionEvent.ACTION_MOVE
+                || action == MotionEvent.ACTION_POINTER_DOWN;
+        int flags = gone ? 0 : Wire.PEN_IN_RANGE;
+        if (touching) flags |= Wire.PEN_TOUCHING;
+        if ((e.getButtonState() & MotionEvent.BUTTON_STYLUS_PRIMARY) != 0) {
+            flags |= Wire.PEN_BUTTON;
+        }
+        if (e.getToolType(i) == MotionEvent.TOOL_TYPE_ERASER) flags |= Wire.PEN_ERASER;
+        penInRange = !gone;
+        // A lifted pen normally goes on to hover, and leaving is reported.
+        // If neither follows the lift, treat the pen as gone, or fingers
+        // would stay ignored.
+        ui.removeCallbacks(penGone);
+        if (action == MotionEvent.ACTION_UP) ui.postDelayed(penGone, PEN_GONE_MS);
+
+        // Samples the system batched between frames, oldest first, then
+        // the current one: strokes keep their shape at speed.
+        int history = touching ? e.getHistorySize() : 0;
+        for (int k = 0; k <= history; k++) {
+            boolean last = k == history;
+            float x = last ? e.getX(i) : e.getHistoricalX(i, k);
+            float y = last ? e.getY(i) : e.getHistoricalY(i, k);
+            float p = last ? e.getPressure(i) : e.getHistoricalPressure(i, k);
+            float tilt = last ? e.getAxisValue(MotionEvent.AXIS_TILT, i)
+                    : e.getHistoricalAxisValue(MotionEvent.AXIS_TILT, i, k);
+            float dir = last ? e.getOrientation(i) : e.getHistoricalOrientation(i, k);
+            // Android: tilt is the angle from upright, orientation the
+            // direction the pen leans, 0 = towards the top of the screen.
+            double deg = Math.toDegrees(tilt);
+            post(link, Wire.pen(flags,
+                    Wire.unit(x / (w - 1)), Wire.unit(y / (h - 1)),
+                    touching ? Wire.unit(p) : 0,
+                    (int) Math.round(Math.sin(dir) * deg),
+                    (int) Math.round(-Math.cos(dir) * deg)));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -376,6 +502,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
                 decoder = createDecoder(codec, width, height, cb,
                         new Handler(codecThread.getLooper()));
                 decoder.start();
+                sender = cb;
 
                 while (running && wire.next()) {
                     switch (wire.type()) {
@@ -397,6 +524,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
                 }
                 Log.i(TAG, "host closed the stream");
             } finally {
+                sender = null;
                 if (decoder != null) {
                     try { decoder.stop(); } catch (Exception ignore) { }
                     try { decoder.release(); } catch (Exception ignore) { }

@@ -90,6 +90,43 @@ public class WireTest {
     }
 
     @Test
+    public void fingersAndPenLayout() {
+        ByteBuffer f = ByteBuffer.wrap(Wire.fingers(2, new int[] {0, 3},
+                new boolean[] {true, false}, new int[] {65535, 7}, new int[] {1, 40000}))
+                .order(ByteOrder.LITTLE_ENDIAN);
+        assertEquals('F', f.get());
+        assertEquals(13, f.getInt());
+        assertEquals(2, f.get());
+        assertEquals(0, f.get());
+        assertEquals(1, f.get());
+        assertEquals(65535, f.getShort() & 0xffff);
+        assertEquals(1, f.getShort() & 0xffff);
+        assertEquals(3, f.get());
+        assertEquals(0, f.get());
+        assertEquals(7, f.getShort() & 0xffff);
+        assertEquals(40000, f.getShort() & 0xffff);
+
+        ByteBuffer n = ByteBuffer.wrap(Wire.pen(
+                Wire.PEN_IN_RANGE | Wire.PEN_TOUCHING, 100, 200, 65535, -200, 45))
+                .order(ByteOrder.LITTLE_ENDIAN);
+        assertEquals('N', n.get());
+        assertEquals(9, n.getInt());
+        assertEquals(3, n.get());
+        assertEquals(100, n.getShort() & 0xffff);
+        assertEquals(200, n.getShort() & 0xffff);
+        assertEquals(65535, n.getShort() & 0xffff);
+        assertEquals(-90, n.get());
+        assertEquals(45, n.get());
+    }
+
+    @Test
+    public void unitClampsToTheWireRange() {
+        assertEquals(0, Wire.unit(-0.5f));
+        assertEquals(65535, Wire.unit(2f));
+        assertEquals(32768, Wire.unit(0.5f));
+    }
+
+    @Test
     public void helloAndAckLayout() {
         ByteBuffer h = ByteBuffer.wrap(Wire.hello(2560, 1600, 244, 3))
                 .order(ByteOrder.LITTLE_ENDIAN);

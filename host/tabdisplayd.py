@@ -21,6 +21,10 @@ Wire protocol, both directions: [u8 type][u32 LE length][payload].
     'A'  u64 capture timestamp of a frame now on screen, u32 us the tablet
          held it (arrival -> handed to the display)
     'T'  echo of a host 'T', payload unchanged
+    'F'  fingers: u8 count, then per pointer u8 id, u8 down, u16 x, u16 y
+    'N'  pen: u8 flags (1 in range, 2 touching, 4 side button, 8 eraser),
+         u16 x, u16 y, u16 pressure, i8 tilt x, i8 tilt y (degrees)
+         Positions and pressure are 0..65535 across the picture.
   host -> tablet
     'C'  u16 version, u32 width, u32 height, u8 codec (0 H.264, 1 HEVC)
     'V' 'P' 'S'  tdcap records, passed through unchanged (see tdcap.c)
@@ -40,9 +44,10 @@ import time
 
 from gi.repository import Gio, GLib
 
+import inputdev
 from scrub import Scrubber
 
-VERSION = 3
+VERSION = 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = "com.tabdisplay"
 ACTIVITY = APP + "/.DisplayActivity"
@@ -108,6 +113,7 @@ class Layout:
         self.applying = False
         self.settled = False    # set once the initial layout is in place
         self.virtual_rect = None    # logical x, y, w, h of our monitor
+        self.virtual_spec = None    # its [vendor, product, serial]
 
     def _state(self):
         return self.bus.call_sync(DC, DC_PATH, DC, "GetCurrentState", None,
@@ -120,6 +126,8 @@ class Layout:
             for mode in mode_list:
                 if mode[6].get("is-current"):
                     sizes[spec[0]] = (mode[1], mode[2])
+            if self._virtual(spec[0]):
+                self.virtual_spec = list(spec[1:4])
         for lm in logical:
             conn = lm[5][0][0]
             if self._virtual(conn) and conn in sizes:
@@ -427,6 +435,7 @@ class Daemon:
         self.pointer = None
         self.pointer_on = False
         self.scrubber = Scrubber()
+        self.input = None               # virtual touchscreen + pen
         self.sent = self.acked = 0
         self.ack_cond = threading.Condition()
         self.send_lock = threading.Lock()
@@ -595,6 +604,9 @@ class Daemon:
                                            self.layout, self.on_record,
                                            self.on_capture_exit)
                     self.capture.start()
+                    if not self.args.no_input:
+                        self.input = inputdev.open_devices(
+                            width, height, dpi, self.layout.virtual_spec)
                 else:
                     self.capture.command("idr")
             except Exception as exc:
@@ -616,6 +628,10 @@ class Daemon:
                     with self.ack_cond:
                         self.acked += 1
                         self.ack_cond.notify_all()
+                elif kind in "FN":
+                    devices = self.input
+                    if devices is not None:
+                        devices.handle(kind, payload)
                 elif kind == "T" and len(payload) >= 8:
                     sent_at = struct.unpack_from("<Q", payload)[0]
                     with self.stats.lock:
@@ -635,6 +651,8 @@ class Daemon:
                 return
             log.info("tablet disconnected (%s)", why)
             self.client = None
+            if self.input is not None:
+                self.input.release_all()    # no finger left held down
             with self.ack_cond:
                 self.ack_cond.notify_all()
             try:
@@ -659,6 +677,9 @@ class Daemon:
             if self.linger is not None:
                 self.linger.cancel()
                 self.linger = None
+            devices, self.input = self.input, None
+            if devices is not None:
+                devices.close()
             capture, self.capture = self.capture, None
             if capture is not None:
                 log.info("removing the virtual monitor (%s)", why)
@@ -824,6 +845,8 @@ def build_parser():
                    help="overlay: the tablet draws the pointer itself, so it "
                         "tracks the mouse without video latency. embedded: "
                         "the pointer is part of the video.")
+    p.add_argument("--no-input", action="store_true",
+                   help="do not create the virtual touchscreen and pen")
     p.add_argument("--rc", choices=["cqp", "vbr", "cbr"], default="cqp")
     p.add_argument("--qp", type=int, default=24)
     p.add_argument("--bitrate", type=int, default=20000, help="kbit/s")
