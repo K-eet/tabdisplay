@@ -10,12 +10,14 @@
         android:supportsRtl="false">
 
         <activity
-            android:name=".ReceiverActivity_v2"
+            android:name=".DisplayActivity"
             android:exported="true"
-            android:screenOrientation="landscape"
-            android:configChanges="orientation|screenSize|keyboardHidden"
-            android:keepScreenOn="true"
-            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -1,80 +1,86 @@
 # tabdisplay
 
-Use an Android tablet as an extended display for a Linux desktop, over USB.
+Use an Android tablet as a second monitor for a GNOME/Wayland desktop, over USB.
 
 ```
-mutter ──► evdi virtual display ──► daemon_v2.py ──► ffmpeg (h264_vaapi)
-                                                          │
-tablet: MediaCodec ◄── ReceiverActivity_v2 ◄── adb reverse ◄── TCP :7070
+mutter virtual monitor ──dmabuf──► host/tdcap (VAAPI H.264) ──pipe──► host/tabdisplayd.py
+                                                                            │
+tablet: MediaCodec + pointer overlay ◄── DisplayActivity ◄── adb reverse ◄── TCP :7070
 ```
+
+Plug the tablet in: a monitor appears in Settings → Displays and the tablet
+shows it. Unplug: the monitor goes away and its windows return to the laptop.
 
 | Piece | What it does |
 |---|---|
-| `daemon_v2.py` | Owns the evdi card, feeds raw frames to ffmpeg, sends encoded frames to the tablet |
-| `android/` | The receiver app (`ReceiverActivity_v2` + `FrameReader`) |
-| `start.sh` | Arms `adb reverse`, relaunches the app, runs the daemon |
-| `edid_2560x1600.bin`, `generate_edid.py` | The EDID the virtual display advertises |
-| `patches/` | The one pyevdi change the daemon depends on |
-| `tests/` | Sender tests |
-| `phase*_log.md`, `review_*.md` | History: how it got here and why |
+| `host/tabdisplayd.py` | Daemon: adb link, virtual monitor lifecycle, layout, stream relay, stats |
+| `host/tdcap.c` | PipeWire screencast → VAAPI encoder, zero-copy; paces frames to 60 Hz |
+| `host/scrub.py` | Forces a repaint to clear a mutter stale-pointer bug |
+| `android/` | Receiver app (`DisplayActivity`, `Wire`) |
+| `install.sh` | Builds everything, installs the udev rule and systemd user service |
+| `bench/` | Load generator, fake client, capture probes used for the numbers below |
+| `tests/test_host.py` | Host tests (no tablet, no compositor needed) |
+| `notes_2026-11-11.md` | Why it is built this way: measurements and mutter quirks |
 
-## Wire protocol
+`daemon_v2.py`, `start.sh`, `tests/test_daemon.py`, the EDID files, `patches/`
+and `evdi-src/` are the previous evdi-based pipeline. Nothing uses them any
+more and the current app does not speak their protocol; they are kept only
+until the new pipeline has had some use.
 
-A plain TCP stream of `[u32 big-endian length][one H.264 access unit]`,
-nothing else. Each AU is Annex B and starts with an AUD. The first AU after
-every connect is SPS+PPS+IDR, and an IDR follows at least every 0.5 s of
-wall-clock time. Fixed 2560×1600, one client at a time (a new connection
-replaces the old one).
+## Requirements
 
-## Setup
-
-Kernel module and build dependencies (Ubuntu 24.04):
+GNOME Shell 46 on Wayland, a GPU with VAAPI H.264 encode, PipeWire, Xwayland.
 
 ```sh
-sudo apt-get install -y dkms evdi-dkms libdrm-dev python3-pybind11 python3-dev ffmpeg
-sudo modprobe evdi
+sudo apt-get install -y build-essential pkg-config adb ffmpeg \
+    libpipewire-0.3-dev libavcodec-dev libavfilter-dev libavutil-dev libdrm-dev
 ```
 
-pyevdi, with the local patch. `evdi-src/` is a plain clone of upstream at
-`v1.14.2`; it is **not** a submodule, so a fresh checkout of this repo needs:
+Android app: JDK 17 (`/usr/lib/jvm/java-17-openjdk-amd64`) and the Android SDK.
+Tablet: USB debugging on, this computer authorised.
+
+## Install
 
 ```sh
-git clone --branch v1.14.2 https://github.com/DisplayLink/evdi.git evdi-src
-git -C evdi-src am ../patches/0001-pyevdi-expose-framebuffer-as-memoryview.patch
-make -C evdi-src/library
-make -C evdi-src/pyevdi
+./install.sh              # tablet plugged in
+./install.sh --remove     # undo the service and udev rule
 ```
 
-Android app. Needs a JDK that ships `jlink` (JDK 17 here; the default
-Java 21 on this machine is a JRE and fails the build):
+After that the service starts when this tablet (matched by USB serial) is
+plugged in and stops when it is unplugged.
+Logs: `journalctl --user -u tabdisplay -f`.
+
+## Run by hand
 
 ```sh
-cd android
-JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 ./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+make -C host
+python3 host/tabdisplayd.py --serial <adb serial>
+python3 host/tabdisplayd.py --help
 ```
 
-The daemon and the app must come from the same revision: the wire protocol
-has no version negotiation.
+Useful options: `--scale 1.75` (initial display scale), `--cursor embedded`
+(pointer inside the video instead of drawn by the tablet), `--codec hevc`,
+`--size 1920x1200` (render smaller, tablet scales up), `--rc vbr --bitrate 20000`.
 
-## Run
+Position and scale set in Settings → Displays are remembered in
+`~/.config/tabdisplay/layout.json` and restored on the next plug.
 
-```sh
-./start.sh                      # ADB_SERIAL=<serial> to pick a tablet
-./start.sh --no-auto-mode --bitrate 15M   # extra flags go to the daemon
-python3 daemon_v2.py --help
-```
-
-The daemon listens on `127.0.0.1` only; the stream is unauthenticated.
+Every 5 s the daemon logs frame rate, bitrate and the time from a frame being
+captured to the tablet handing it to its display.
 
 ## Test
 
 ```sh
-python3 -m unittest discover -s tests            # sender
+python3 -m unittest tests.test_host
 cd android && JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 ./gradlew testDebugUnitTest
+python3 host/tabdisplayd.py --no-adb & python3 bench/fakeclient.py 5   # end to end, no tablet
 ```
 
-The sender suite needs no tablet and no evdi device. Tests that drive the
-real encoder are skipped without ffmpeg and `/dev/dri/renderD128`.
-`test_pyevdi.py` is a manual hardware smoke test for the evdi binding; it
-creates a real virtual display.
+## Wire protocol (v3)
+
+Both directions: `[u8 type][u32 LE length][payload]`. The message catalogue is
+in the docstring of `host/tabdisplayd.py`; video, pointer and sprite records
+are defined in `host/tdcap.c`. Daemon and app must be the same version; a
+mismatch is refused at the hello.
+
+The daemon listens on `127.0.0.1` only; the stream is unauthenticated.

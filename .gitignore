@@ -6,3 +6,4 @@ tools/
 android/.gradle/
 android/app/build/
 android/local.properties
+host/tdcap
